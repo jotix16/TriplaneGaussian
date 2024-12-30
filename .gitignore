@@ -5,3 +5,4 @@ pointnet2_ops_lib
 *_rgba.*
 build
 *.egg-info/
+__pycache__/
