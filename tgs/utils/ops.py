@@ -12,7 +12,7 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Pointclouds
 from pytorch3d.utils.camera_conversions import cameras_from_opencv_projection
 import cv2
-
+from einops import rearrange, repeat, reduce, pack, unpack
 from tgs.utils.typing import *
 
 ValidScale = Union[Tuple[float, float], Num[Tensor, "2 D"]]
@@ -229,46 +229,155 @@ def get_intrinsic_from_fov(fov, H, W, bs=-1):
 
     return torch.from_numpy(intrinsic)
 
-def points_projection(points: Float[Tensor, "B Np 3"],
-                    c2ws: Float[Tensor, "B 4 4"],
-                    intrinsics: Float[Tensor, "B 3 3"],
-                    local_features: Float[Tensor, "B C H W"],
-                    # Rasterization settings
-                    raster_point_radius: float = 0.0075,  # point size
-                    raster_points_per_pixel: int = 1,  # a single point per pixel, for now
-                    bin_size: int = 0):
-    B, C, H, W = local_features.shape
-    device = local_features.device
-    raster_settings = PointsRasterizationSettings(
-            image_size=(H, W),
-            radius=raster_point_radius,
-            points_per_pixel=raster_points_per_pixel,
-            bin_size=bin_size,
-        )
-    Np = points.shape[1]
-    R = raster_settings.points_per_pixel
+def interpolate_image_tokens(
+    image_tokens: Float[Tensor, "B Nv C Nt"],
+    h: int,
+    w: int,
+    token_patch_size: int = 14,
+):
+    """
+    Interpolate image features from shape (B, Nv, C, Nt) to (B, Nv, C, h, w)
 
+    """
+    B = image_tokens.shape[0]
+
+    local_features = rearrange(
+        image_tokens,
+        "B Nv C (H W) -> (B Nv) C H W",
+        H=h // token_patch_size,
+        W=w // token_patch_size,
+    ).contiguous()
+    local_features = F.interpolate(
+        local_features,
+        size=(h, w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return rearrange(local_features, "(B Nv) C H W -> B Nv C H W", B=B)
+
+def points_projection(
+    points: Float[Tensor, "B NP 3"],
+    c2ws: Float[Tensor, "B 4 4"] | Float[Tensor, "B NV 4 4"],
+    intrinsics: Float[Tensor, "B 3 3"] | Float[Tensor, "B NV 3 3"],
+    local_features: Float[Tensor, "B C H W"] | Float[Tensor, "B NV C H W"],
+    # Rasterization settings
+    raster_point_radius: float = 0.0075,  # point size
+    raster_points_per_pixel: int = 1,  # a single point per pixel, for now
+    bin_size: int = 0,
+    # ('min', 'max', 'sum', 'mean', 'prod', "fuse_mean_std_cat") or a custom function
+    fuse_function: str | Callable[[Tensor, List[int]], Tensor] = "mean",
+) -> Float[Tensor, "B NP C"]:
+
+    if c2ws.ndim == 3:  # or (c2ws.ndim == 4 and c2ws.shape[1] == 1):
+        # if c2ws.ndim == 4:
+        #     c2ws = c2ws.squeeze(1)
+        #     intrinsics = intrinsics.squeeze(1)
+        #     local_features = local_features.squeeze(1)
+
+        return points_projection_single_view(
+            points,
+            c2ws,
+            intrinsics,
+            local_features,
+            raster_point_radius,
+            raster_points_per_pixel,
+            bin_size,
+        )
+
+    elif c2ws.ndim == 4:
+        return points_projection_multi_view(
+            points,
+            c2ws,
+            intrinsics,
+            local_features,
+            raster_point_radius,
+            raster_points_per_pixel,
+            bin_size,
+            fuse_function=fuse_function,
+        )
+
+    else:
+        raise ValueError(f"Invalid c2ws shape, got {c2ws.shape}")
+
+def points_projection_single_view(
+    points: Float[Tensor, "B NP 3"],
+    c2ws: Float[Tensor, "B 4 4"],
+    intrinsics: Float[Tensor, "B 3 3"],
+    local_features: Float[Tensor, "B C H W"],
+    # Rasterization settings
+    raster_point_radius: float = 0.0075,  # point size
+    raster_points_per_pixel: int = 1,  # a single point per pixel, for now
+    bin_size: int = 0,
+):
+    B, C, H, W = local_features.shape
+    NP = points.shape[1]
+    R = raster_points_per_pixel
+    device = local_features.device
+
+    # Prepare cameras
     w2cs = torch.inverse(c2ws)
-    image_size = torch.as_tensor([H, W]).view(1, 2).expand(w2cs.shape[0], -1).to(device)
+    image_size = repeat(w2cs.new_tensor([H, W]), "hw -> B hw", B=B)
     cameras = cameras_from_opencv_projection(w2cs[:, :3, :3], w2cs[:, :3, 3], intrinsics, image_size)
 
+    # Prepare rasterizer-settings
+    raster_settings = PointsRasterizationSettings(
+        image_size=(H, W),
+        radius=raster_point_radius,
+        points_per_pixel=R,
+        bin_size=bin_size,
+    )
+
+    # Rasterize points
     rasterize = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
     fragments = rasterize(Pointclouds(points))
+
+    # Visible pixels
+    # fragments_idx: point_index for each pixel (-1==no point)
+    # visible_pixels: whether the pixel is visible
+    # points_to_visible_pixels: point_index for each visible pixel
     fragments_idx: Tensor = fragments.idx.long()
-    visible_pixels = (fragments_idx > -1)  # (B, H, W, R)
+    visible_pixels = fragments_idx > -1  # (B, H, W, R)
     points_to_visible_pixels = fragments_idx[visible_pixels]
 
     # Reshape local features to (B, H, W, R, C)
-    local_features = local_features.permute(0, 2, 3, 1).unsqueeze(-2).expand(-1, -1, -1, R, -1)  # (B, H, W, R, C)
+    local_features = repeat(local_features, "B C H W -> B H W R C", R=R)
 
     # Get local features corresponding to visible points
-    local_features_proj = torch.zeros(B * Np, C, device=device)
+    local_features_proj = torch.zeros(B * NP, C, device=device)
     local_features_proj[points_to_visible_pixels] = local_features[visible_pixels]
-    local_features_proj = local_features_proj.reshape(B, Np, C)
+    local_features_proj = rearrange(local_features_proj, "(B NP) C -> B NP C", B=B).contiguous()
 
     return local_features_proj
 
+def points_projection_multi_view(
+    points: Float[Tensor, "B NP 3"],
+    c2ws: Float[Tensor, "B NV 4 4"],
+    intrinsics: Float[Tensor, "B NV 3 3"],
+    local_features: Float[Tensor, "B NV C H W"],
+    raster_point_radius: float = 0.0075,  # point size
+    raster_points_per_pixel: int = 1,  # a single point per pixel, for now
+    bin_size: int = 0,
+    # ('min', 'max', 'sum', 'mean', 'prod', "fuse_mean_std_cat") or a custom function
+    fuse_function: str | Callable[[Tensor, List[int]], Tensor] = "mean",
+):
+    if fuse_function == "fuse_mean_std_cat":
+        fuse_function = fuse_mean_std_cat  # doubles the feature dimension
+
+    points = repeat(points, "B NP xyz -> (B NV) NP xyz", NV=c2ws.shape[1])
+    c2ws, ps = pack([c2ws], "* i j")
+    intrinsics, ps = pack([intrinsics], "* i j")
+    local_features, ps = pack([local_features], "* C H W")
+
+    local_features_proj = points_projection_single_view(
+        points, c2ws, intrinsics, local_features, raster_point_radius, raster_points_per_pixel, bin_size
+    )
+    local_features_proj = unpack(local_features_proj, ps, "* NP C")[0]
+    local_features_proj = reduce(local_features_proj, "B NV NP C -> B NP C", fuse_function).contiguous()
+    return local_features_proj
+
+
 def compute_distance_transform(mask: torch.Tensor):
+    # Float[Tensor, "B 1 H W"]) -> Float[Tensor, "B 1 H W"]
     image_size = mask.shape[-1]
     distance_transform = torch.stack([
         torch.from_numpy(cv2.distanceTransform(
@@ -277,3 +386,12 @@ def compute_distance_transform(mask: torch.Tensor):
         for m in mask.squeeze(1).detach().cpu().numpy().astype(np.uint8)
     ]).unsqueeze(1).clip(0, 1).to(mask.device)
     return distance_transform
+
+def fuse_mean_std_cat(x: Tensor, dim: list[int] = [1], keepdim: bool = False):
+    # eg. x: (B, N, C) -> (B, C*2)
+    # Instant Multi-View Head Capture through Learnable Registration, Bolkart et al., CVPR 2023
+    # https://ps.is.mpg.de/uploads_file/attachment/attachment/711/CVPR2023_Multiview_Face_Capture.pdf
+    # https://github.com/TimoBolkart/TEMPEH
+    mean = x.mean(dim=dim, keepdim=keepdim)
+    std = x.std(dim=dim, keepdim=keepdim)
+    return torch.cat([mean, std], dim=-1)

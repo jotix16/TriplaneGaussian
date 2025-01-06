@@ -55,37 +55,33 @@ class TriplaneUpsampleNetwork(BaseModule):
 
 
 class MLP(nn.Module):
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        n_neurons: int,
-        n_hidden_layers: int,
-        activation: str = "relu",
-        output_activation: Optional[str] = None,
-        bias: bool = True,
-    ):
+    @dataclass
+    class Config:
+        dim_in: int
+        dim_out: int
+        n_neurons: int
+        n_hidden_layers: int
+        activation: str = "relu"
+        output_activation: Optional[str] = None
+        bias: bool = True
+
+    cfg: Config
+
+    def __init__(self, cfg: Config):
         super().__init__()
+        self.cfg = cfg
         layers = [
-            self.make_linear(
-                dim_in, n_neurons, is_first=True, is_last=False, bias=bias
-            ),
-            self.make_activation(activation),
+            self.make_linear(cfg.dim_in, cfg.n_neurons, is_first=True, is_last=False, bias=cfg.bias),
+            self.make_activation(cfg.activation),
         ]
-        for i in range(n_hidden_layers - 1):
+        for i in range(cfg.n_hidden_layers - 1):
             layers += [
-                self.make_linear(
-                    n_neurons, n_neurons, is_first=False, is_last=False, bias=bias
-                ),
-                self.make_activation(activation),
+                self.make_linear(cfg.n_neurons, cfg.n_neurons, is_first=False, is_last=False, bias=cfg.bias),
+                self.make_activation(cfg.activation),
             ]
-        layers += [
-            self.make_linear(
-                n_neurons, dim_out, is_first=False, is_last=True, bias=bias
-            )
-        ]
+        layers += [self.make_linear(cfg.n_neurons, cfg.dim_out, is_first=False, is_last=True, bias=cfg.bias)]
         self.layers = nn.Sequential(*layers)
-        self.output_activation = get_activation(output_activation)
+        self.output_activation = get_activation(cfg.output_activation)
 
     def forward(self, x):
         x = self.layers(x)

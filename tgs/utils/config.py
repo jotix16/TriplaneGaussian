@@ -69,6 +69,8 @@ def dump_config(path: str, config) -> None:
         OmegaConf.save(config=config, f=fp)
 
 
-def parse_structured(fields: Any, cfg: Optional[Union[dict, DictConfig]] = None) -> Any:
+def parse_structured(fields: Any, cfg: Optional[Union[dict, DictConfig, dataclass]] = None) -> Any:
+    if isinstance(cfg, fields):
+        return cfg
     scfg = OmegaConf.structured(fields(**cfg))
     return scfg
