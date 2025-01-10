@@ -2,8 +2,8 @@ import glob
 import os
 import os.path as osp
 
-from setuptools import find_packages, setup
 import torch
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = osp.dirname(osp.abspath(__file__))
@@ -18,7 +18,7 @@ requirements = ["torch>=1.4"]
 exec(open(osp.join("pointnet2_ops", "_version.py")).read())
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(map(str, torch.cuda.get_device_capability()))
-# os.environ["TORCH_CUDA_ARCH_LIST"] = "5.0;6.0;6.1;6.2;7.0;7.5;8.0;8.6"
+os.environ["TORCH_CUDA_ARCH_LIST"] = "5.0;6.0;6.1;6.2;7.0;7.5;8.0;8.6;8.7;8.9;9.0"
 setup(
     name="pointnet2_ops",
     version=__version__,

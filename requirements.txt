@@ -3,10 +3,11 @@ OmegaConf
 matplotlib
 einops
 gradio
-diffusers==0.19.3
-transformers==4.34.1
+diffusers
+transformers
 rembg
 segment_anything
 jaxtyping
 imageio
 imageio-ffmpeg
+# pip3 install -U xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu118
